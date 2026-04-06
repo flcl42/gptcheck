@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Globalization;
 using System.Runtime.InteropServices;
 using System.Text.Json;
+using Microsoft.Win32;
 
 namespace GptCheck;
 
@@ -608,58 +609,71 @@ internal sealed class CodexUsageReader
 internal static class TrayIconRenderer
 {
     private const int IconSize = 16;
-    private const int GlyphWidth = 3;
-    private const int GlyphHeight = 5;
+    private const int GlyphWidth = 4;
+    private const int GlyphHeight = 7;
     private const int GlyphSpacing = 1;
+    private static readonly IconPalette LightThemePalette = new(
+        UnknownColor: 0xFF444444,
+        DangerColor: 0xFF9D2B22,
+        WarningColor: 0xFF8C5D00,
+        SafeColor: 0xFF1E6F36);
+    private static readonly IconPalette DarkThemePalette = new(
+        UnknownColor: 0xFFD8D8D8,
+        DangerColor: 0xFFFF6C62,
+        WarningColor: 0xFFF1C84A,
+        SafeColor: 0xFF72E089);
 
     private static readonly IReadOnlyDictionary<char, string[]> Glyphs = new Dictionary<char, string[]>
     {
-        ['0'] = ["111", "101", "101", "101", "111"],
-        ['1'] = ["010", "110", "010", "010", "111"],
-        ['2'] = ["111", "001", "111", "100", "111"],
-        ['3'] = ["111", "001", "111", "001", "111"],
-        ['4'] = ["101", "101", "111", "001", "001"],
-        ['5'] = ["111", "100", "111", "001", "111"],
-        ['6'] = ["111", "100", "111", "101", "111"],
-        ['7'] = ["111", "001", "001", "001", "001"],
-        ['8'] = ["111", "101", "111", "101", "111"],
-        ['9'] = ["111", "101", "111", "001", "111"],
-        ['?'] = ["111", "001", "011", "000", "010"]
+        ['0'] = ["0110", "1001", "1001", "1001", "1001", "1001", "0110"],
+        ['1'] = ["0010", "0110", "0010", "0010", "0010", "0010", "0111"],
+        ['2'] = ["0110", "1001", "0001", "0010", "0100", "1000", "1111"],
+        ['3'] = ["1110", "0001", "0001", "0110", "0001", "0001", "1110"],
+        ['4'] = ["1001", "1001", "1001", "1111", "0001", "0001", "0001"],
+        ['5'] = ["1111", "1000", "1000", "1110", "0001", "0001", "1110"],
+        ['6'] = ["0111", "1000", "1000", "1110", "1001", "1001", "0110"],
+        ['7'] = ["1111", "0001", "0001", "0010", "0010", "0100", "0100"],
+        ['8'] = ["0110", "1001", "1001", "0110", "1001", "1001", "0110"],
+        ['9'] = ["0110", "1001", "1001", "0111", "0001", "0001", "1110"],
+        ['?'] = ["1110", "0001", "0010", "0010", "0000", "0010", "0000"]
     };
 
     public static IntPtr CreateUsageIcon(CodexUsageSnapshot snapshot)
     {
+        IconPalette palette = GetPalette();
         int primaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.PrimaryUsedPercent);
         int secondaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.SecondaryUsedPercent);
 
         return CreateIcon(
             primaryRemaining.ToString(CultureInfo.InvariantCulture),
-            ColorForRemaining(primaryRemaining),
+            ColorForRemaining(primaryRemaining, palette),
             secondaryRemaining.ToString(CultureInfo.InvariantCulture),
-            ColorForRemaining(secondaryRemaining));
+            ColorForRemaining(secondaryRemaining, palette));
     }
 
     public static IntPtr CreateUnavailableIcon()
     {
-        return CreateIcon("?", 0xFF8A8A8A, "?", 0xFF8A8A8A);
+        IconPalette palette = GetPalette();
+        return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor);
     }
 
     private static IntPtr CreateIcon(string topText, uint topColor, string bottomText, uint bottomColor)
     {
         uint[] pixels = new uint[IconSize * IconSize];
-        DrawText(pixels, topText, 2, topColor);
-        DrawText(pixels, bottomText, 9, bottomColor);
+        DrawText(pixels, topText, 0, topColor);
+        DrawText(pixels, bottomText, 8, bottomColor);
         return CreateNativeIcon(pixels);
     }
 
-    private static void DrawText(uint[] pixels, string text, int y, uint color)
+    private static void DrawText(uint[] pixels, string text, int y, uint fillColor)
     {
         int width = (text.Length * GlyphWidth) + Math.Max(0, text.Length - 1) * GlyphSpacing;
         int startX = Math.Max(0, (IconSize - width) / 2);
 
         for (int index = 0; index < text.Length; index++)
         {
-            DrawGlyph(pixels, text[index], startX + (index * (GlyphWidth + GlyphSpacing)), y, color);
+            int glyphX = startX + (index * (GlyphWidth + GlyphSpacing));
+            DrawGlyph(pixels, text[index], glyphX, y, fillColor);
         }
     }
 
@@ -754,20 +768,48 @@ internal static class TrayIconRenderer
         return iconHandle;
     }
 
-    private static uint ColorForRemaining(int remainingPercent)
+    private static uint ColorForRemaining(int remainingPercent, IconPalette palette)
     {
         if (remainingPercent <= 15)
         {
-            return 0xFFD24A3D;
+            return palette.DangerColor;
         }
 
         if (remainingPercent <= 40)
         {
-            return 0xFFDEA643;
+            return palette.WarningColor;
         }
 
-        return 0xFF5AB961;
+        return palette.SafeColor;
     }
+
+    private static IconPalette GetPalette()
+    {
+        return IsLightTaskbarTheme() ? LightThemePalette : DarkThemePalette;
+    }
+
+    private static bool IsLightTaskbarTheme()
+    {
+        const string personalizeKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+        try
+        {
+            using RegistryKey? personalizeKey = Registry.CurrentUser.OpenSubKey(personalizeKeyPath, writable: false);
+            object? value = personalizeKey?.GetValue("SystemUsesLightTheme");
+            return value switch
+            {
+                int intValue => intValue != 0,
+                byte byteValue => byteValue != 0,
+                _ => false
+            };
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private sealed record IconPalette(uint UnknownColor, uint DangerColor, uint WarningColor, uint SafeColor);
 }
 
 internal static class NativeMethods
