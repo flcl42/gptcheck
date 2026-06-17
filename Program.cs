@@ -18,29 +18,43 @@ internal static class Program
 
 internal sealed class TrayApplication : IDisposable
 {
-    private const uint TrayIconId = 1;
+    private const uint CodexTrayIconId = 1;
+    private const uint ClaudeTrayIconId = 2;
     private const uint TrayCallbackMessage = NativeMethods.WM_APP + 1;
+    private const uint ClaudeResultMessage = NativeMethods.WM_APP + 2;
     private const nuint RefreshTimerId = 1;
     private const uint RefreshIntervalMs = 300_000;
     private const uint CommandRefresh = 1001;
-    private const uint CommandOpenSessions = 1002;
+    private const uint CommandOpenCodexSessions = 1002;
     private const uint CommandExit = 1003;
+    private const uint CommandOpenClaudeUsage = 1004;
 
     private static readonly NativeMethods.WndProcDelegate WindowProcedure = HandleWindowMessage;
     private static TrayApplication? Current;
 
-    private readonly CodexUsageReader _usageReader = new();
+    private readonly CodexUsageReader _codexUsageReader = new();
+    private readonly ClaudeUsageReader _claudeUsageReader = new();
     private readonly string _windowClassName = $"gptcheck.{Environment.ProcessId}";
 
     private IntPtr _windowHandle;
-    private IntPtr _iconHandle;
-    private bool _trayIconAdded;
+    private IntPtr _codexIconHandle;
+    private IntPtr _claudeIconHandle;
+    private bool _codexTrayIconAdded;
+    private bool _claudeTrayIconAdded;
     private bool _windowClassRegistered;
-    private string _tooltip = "gptcheck";
-    private string _statusText = "Loading Codex usage...";
-    private string _detailText = "Reading local Codex sessions.";
-    private string _updatedText = string.Empty;
-    private string _sourceText = string.Empty;
+    private string _codexTooltip = "gptcheck";
+    private string _codexStatusText = "Loading Codex usage...";
+    private string _codexDetailText = "Reading local Codex sessions.";
+    private string _codexSparkUsageText = "Spark usage: loading...";
+    private string _codexUpdatedText = string.Empty;
+    private string _codexSourceText = string.Empty;
+    private string _claudeTooltip = "Claude usage";
+    private string _claudeStatusText = "Loading Claude usage...";
+    private string _claudeDetailText = "Reading Claude OAuth usage.";
+    private string _claudeUpdatedText = string.Empty;
+    private string _claudeSourceText = string.Empty;
+    private volatile bool _claudeRefreshInFlight;
+    private volatile ClaudeUsageReadResult? _pendingClaudeResult;
 
     public int Run()
     {
@@ -113,47 +127,127 @@ internal sealed class TrayApplication : IDisposable
 
     private void RefreshUsage()
     {
-        UsageReadResult result = _usageReader.ReadLatestSnapshot();
+        RefreshCodexUsage();
+        RefreshClaudeUsage();
+    }
+
+    private void RefreshCodexUsage()
+    {
+        UsageReadResult result = _codexUsageReader.ReadLatestSnapshot();
 
         if (result.Snapshot is null)
         {
-            _tooltip = "gptcheck unavailable";
-            _statusText = "No Codex usage data found";
-            _detailText = result.ErrorMessage ?? "No token_count events were found.";
-            _updatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
-            _sourceText = _usageReader.SessionsPath;
-            UpdateTrayIcon(TrayIconRenderer.CreateUnavailableIcon());
+            _codexTooltip = "gptcheck unavailable";
+            _codexStatusText = "No Codex usage data found";
+            _codexDetailText = result.ErrorMessage ?? "No token_count events were found.";
+            _codexSparkUsageText = BuildSparkUsage(result.SparkSnapshot);
+            _codexUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _codexSourceText = _codexUsageReader.SessionsPath;
+            UpdateCodexTrayIcon(TrayIconRenderer.CreateUnavailableIcon());
             return;
         }
 
         CodexUsageSnapshot snapshot = result.Snapshot;
-        _tooltip = BuildTooltip(snapshot);
-        _statusText = BuildHeadline(snapshot);
-        _detailText = BuildDetail(snapshot);
-        _updatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
-        _sourceText = snapshot.SourceFile;
-        UpdateTrayIcon(TrayIconRenderer.CreateUsageIcon(snapshot));
+        _codexTooltip = BuildCodexTooltip(snapshot);
+        _codexStatusText = BuildCodexHeadline(snapshot);
+        _codexDetailText = BuildCodexDetail(snapshot);
+        _codexSparkUsageText = BuildSparkUsage(result.SparkSnapshot);
+        _codexUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _codexSourceText = snapshot.SourceFile;
+        UpdateCodexTrayIcon(TrayIconRenderer.CreateUsageIcon(snapshot));
     }
 
-    private void UpdateTrayIcon(IntPtr newIconHandle)
+    private void RefreshClaudeUsage()
+    {
+        if (_claudeRefreshInFlight)
+        {
+            return;
+        }
+
+        _claudeRefreshInFlight = true;
+        IntPtr windowHandle = _windowHandle;
+
+        // Reading Claude usage is a network call that can take seconds. Doing it on the
+        // message-loop thread would freeze both tray icons and stall the shell, because
+        // Explorer SendMessages to notification-icon owner windows and blocks when the
+        // owner stops pumping. Fetch off-thread and post the result back to the UI thread.
+        Task.Run(() =>
+        {
+            _pendingClaudeResult = _claudeUsageReader.ReadLatestSnapshot();
+
+            if (windowHandle == IntPtr.Zero ||
+                !NativeMethods.PostMessage(windowHandle, ClaudeResultMessage, IntPtr.Zero, IntPtr.Zero))
+            {
+                _claudeRefreshInFlight = false;
+            }
+        });
+    }
+
+    private void ApplyClaudeResult()
+    {
+        ClaudeUsageReadResult? result = _pendingClaudeResult;
+        _pendingClaudeResult = null;
+        _claudeRefreshInFlight = false;
+
+        if (result is null)
+        {
+            return;
+        }
+
+        if (result.Snapshot is null)
+        {
+            _claudeTooltip = "Claude usage unavailable";
+            _claudeStatusText = "No Claude usage data found";
+            _claudeDetailText = result.ErrorMessage ?? "Claude usage limits were not found.";
+            _claudeUpdatedText = $"Checked {DateTimeOffset.Now:HH:mm:ss}";
+            _claudeSourceText = _claudeUsageReader.CredentialsPath;
+            UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeUnavailableIcon());
+            return;
+        }
+
+        ClaudeUsageSnapshot snapshot = result.Snapshot;
+        _claudeTooltip = BuildClaudeTooltip(snapshot);
+        _claudeStatusText = BuildClaudeHeadline(snapshot);
+        _claudeDetailText = BuildClaudeDetail(snapshot);
+        _claudeUpdatedText = $"Seen {snapshot.Timestamp.ToLocalTime():yyyy-MM-dd HH:mm:ss}";
+        _claudeSourceText = snapshot.SourceFile;
+        UpdateClaudeTrayIcon(TrayIconRenderer.CreateClaudeIcon(snapshot));
+    }
+
+    private void UpdateCodexTrayIcon(IntPtr newIconHandle)
+    {
+        UpdateTrayIcon(CodexTrayIconId, newIconHandle, ref _codexIconHandle, ref _codexTrayIconAdded, _codexTooltip);
+    }
+
+    private void UpdateClaudeTrayIcon(IntPtr newIconHandle)
+    {
+        UpdateTrayIcon(ClaudeTrayIconId, newIconHandle, ref _claudeIconHandle, ref _claudeTrayIconAdded, _claudeTooltip);
+    }
+
+    private void UpdateTrayIcon(
+        uint iconId,
+        IntPtr newIconHandle,
+        ref IntPtr iconHandle,
+        ref bool trayIconAdded,
+        string tooltip)
     {
         if (newIconHandle == IntPtr.Zero)
         {
             return;
         }
 
-        IntPtr previousIconHandle = _iconHandle;
-        _iconHandle = newIconHandle;
+        IntPtr previousIconHandle = iconHandle;
+        iconHandle = newIconHandle;
 
-        NativeMethods.NOTIFYICONDATA data = CreateNotifyIconData();
-        if (_trayIconAdded)
+        NativeMethods.NOTIFYICONDATA data = CreateNotifyIconData(iconId, iconHandle, tooltip);
+        if (trayIconAdded)
         {
             NativeMethods.Shell_NotifyIcon(NativeMethods.NIM_MODIFY, ref data);
         }
         else
         {
             NativeMethods.Shell_NotifyIcon(NativeMethods.NIM_ADD, ref data);
-            _trayIconAdded = true;
+            trayIconAdded = true;
         }
 
         if (previousIconHandle != IntPtr.Zero)
@@ -162,17 +256,17 @@ internal sealed class TrayApplication : IDisposable
         }
     }
 
-    private NativeMethods.NOTIFYICONDATA CreateNotifyIconData()
+    private NativeMethods.NOTIFYICONDATA CreateNotifyIconData(uint iconId, IntPtr iconHandle, string tooltip)
     {
         return new NativeMethods.NOTIFYICONDATA
         {
             cbSize = (uint)Marshal.SizeOf<NativeMethods.NOTIFYICONDATA>(),
             hWnd = _windowHandle,
-            uID = TrayIconId,
+            uID = iconId,
             uFlags = NativeMethods.NIF_MESSAGE | NativeMethods.NIF_ICON | NativeMethods.NIF_TIP,
             uCallbackMessage = TrayCallbackMessage,
-            hIcon = _iconHandle,
-            szTip = TruncateTooltip(_tooltip),
+            hIcon = iconHandle,
+            szTip = TruncateTooltip(tooltip),
             szInfo = string.Empty,
             szInfoTitle = string.Empty
         };
@@ -201,7 +295,17 @@ internal sealed class TrayApplication : IDisposable
 
                 break;
 
+            case ClaudeResultMessage:
+                ApplyClaudeResult();
+                return IntPtr.Zero;
+
             case TrayCallbackMessage:
+                uint iconId = (uint)wParam.ToInt64();
+                if (iconId is not CodexTrayIconId and not ClaudeTrayIconId)
+                {
+                    break;
+                }
+
                 switch ((uint)lParam.ToInt64())
                 {
                     case NativeMethods.WM_LBUTTONDBLCLK:
@@ -210,7 +314,7 @@ internal sealed class TrayApplication : IDisposable
 
                     case NativeMethods.WM_RBUTTONUP:
                     case NativeMethods.WM_CONTEXTMENU:
-                        ShowContextMenu();
+                        ShowContextMenu(iconId);
                         return IntPtr.Zero;
                 }
 
@@ -225,7 +329,7 @@ internal sealed class TrayApplication : IDisposable
         return NativeMethods.DefWindowProc(windowHandle, message, wParam, lParam);
     }
 
-    private void ShowContextMenu()
+    private void ShowContextMenu(uint iconId)
     {
         IntPtr menuHandle = NativeMethods.CreatePopupMenu();
         if (menuHandle == IntPtr.Zero)
@@ -233,15 +337,28 @@ internal sealed class TrayApplication : IDisposable
             return;
         }
 
+        bool isClaudeMenu = iconId == ClaudeTrayIconId;
+        string statusText = isClaudeMenu ? _claudeStatusText : _codexStatusText;
+        string detailText = isClaudeMenu ? _claudeDetailText : _codexDetailText;
+        string updatedText = isClaudeMenu ? _claudeUpdatedText : _codexUpdatedText;
+        string sourceText = isClaudeMenu ? _claudeSourceText : _codexSourceText;
+        uint openCommand = isClaudeMenu ? CommandOpenClaudeUsage : CommandOpenCodexSessions;
+        string openLabel = isClaudeMenu ? "Open Claude usage settings" : "Open Codex sessions";
+
         try
         {
-            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_statusText));
-            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_detailText));
-            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_updatedText));
-            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_sourceText));
+            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(statusText));
+            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(detailText));
+            if (!isClaudeMenu)
+            {
+                NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(_codexSparkUsageText));
+            }
+
+            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(updatedText));
+            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING | NativeMethods.MF_GRAYED, 0, LimitMenuText(sourceText));
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_SEPARATOR, 0, null);
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, CommandRefresh, "Refresh now");
-            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, CommandOpenSessions, "Open Codex sessions");
+            NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, openCommand, openLabel);
             NativeMethods.AppendMenu(menuHandle, NativeMethods.MF_STRING, CommandExit, "Exit");
 
             NativeMethods.GetCursorPos(out NativeMethods.POINT cursor);
@@ -273,8 +390,12 @@ internal sealed class TrayApplication : IDisposable
                 RefreshUsage();
                 break;
 
-            case CommandOpenSessions:
-                OpenSessionsFolder();
+            case CommandOpenCodexSessions:
+                OpenCodexSessionsFolder();
+                break;
+
+            case CommandOpenClaudeUsage:
+                OpenClaudeUsagePage();
                 break;
 
             case CommandExit:
@@ -283,15 +404,24 @@ internal sealed class TrayApplication : IDisposable
         }
     }
 
-    private void OpenSessionsFolder()
+    private void OpenCodexSessionsFolder()
     {
-        string target = Directory.Exists(_usageReader.SessionsPath)
-            ? _usageReader.SessionsPath
-            : _usageReader.CodexHomePath;
+        string target = Directory.Exists(_codexUsageReader.SessionsPath)
+            ? _codexUsageReader.SessionsPath
+            : _codexUsageReader.CodexHomePath;
 
         Process.Start(new ProcessStartInfo
         {
             FileName = target,
+            UseShellExecute = true
+        });
+    }
+
+    private static void OpenClaudeUsagePage()
+    {
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = "https://claude.ai/settings/usage",
             UseShellExecute = true
         });
     }
@@ -305,32 +435,16 @@ internal sealed class TrayApplication : IDisposable
 
     private void CleanupNativeResources()
     {
-        if (_trayIconAdded && _windowHandle != IntPtr.Zero)
-        {
-            NativeMethods.NOTIFYICONDATA data = new()
-            {
-                cbSize = (uint)Marshal.SizeOf<NativeMethods.NOTIFYICONDATA>(),
-                hWnd = _windowHandle,
-                uID = TrayIconId,
-                szTip = string.Empty,
-                szInfo = string.Empty,
-                szInfoTitle = string.Empty
-            };
-
-            NativeMethods.Shell_NotifyIcon(NativeMethods.NIM_DELETE, ref data);
-            _trayIconAdded = false;
-        }
+        RemoveTrayIcon(CodexTrayIconId, ref _codexTrayIconAdded);
+        RemoveTrayIcon(ClaudeTrayIconId, ref _claudeTrayIconAdded);
 
         if (_windowHandle != IntPtr.Zero)
         {
             NativeMethods.KillTimer(_windowHandle, RefreshTimerId);
         }
 
-        if (_iconHandle != IntPtr.Zero)
-        {
-            NativeMethods.DestroyIcon(_iconHandle);
-            _iconHandle = IntPtr.Zero;
-        }
+        DestroyIconHandle(ref _codexIconHandle);
+        DestroyIconHandle(ref _claudeIconHandle);
 
         if (_windowClassRegistered)
         {
@@ -339,7 +453,35 @@ internal sealed class TrayApplication : IDisposable
         }
     }
 
-    private static string BuildTooltip(CodexUsageSnapshot snapshot)
+    private void RemoveTrayIcon(uint iconId, ref bool trayIconAdded)
+    {
+        if (trayIconAdded && _windowHandle != IntPtr.Zero)
+        {
+            NativeMethods.NOTIFYICONDATA data = new()
+            {
+                cbSize = (uint)Marshal.SizeOf<NativeMethods.NOTIFYICONDATA>(),
+                hWnd = _windowHandle,
+                uID = iconId,
+                szTip = string.Empty,
+                szInfo = string.Empty,
+                szInfoTitle = string.Empty
+            };
+
+            NativeMethods.Shell_NotifyIcon(NativeMethods.NIM_DELETE, ref data);
+            trayIconAdded = false;
+        }
+    }
+
+    private static void DestroyIconHandle(ref IntPtr iconHandle)
+    {
+        if (iconHandle != IntPtr.Zero)
+        {
+            NativeMethods.DestroyIcon(iconHandle);
+            iconHandle = IntPtr.Zero;
+        }
+    }
+
+    private static string BuildCodexTooltip(CodexUsageSnapshot snapshot)
     {
         int primaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.PrimaryUsedPercent);
         int secondaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.SecondaryUsedPercent);
@@ -349,7 +491,7 @@ internal sealed class TrayApplication : IDisposable
             $"{FormatWindow(snapshot.SecondaryWindowMinutes)} left {secondaryRemaining}%");
     }
 
-    private static string BuildHeadline(CodexUsageSnapshot snapshot)
+    private static string BuildCodexHeadline(CodexUsageSnapshot snapshot)
     {
         string planType = string.IsNullOrWhiteSpace(snapshot.PlanType) ? "plan ?" : snapshot.PlanType;
         int primaryRemaining = CodexUsageMath.GetRemainingPercent(snapshot.PrimaryUsedPercent);
@@ -359,7 +501,7 @@ internal sealed class TrayApplication : IDisposable
                $"{FormatWindow(snapshot.SecondaryWindowMinutes)} left {secondaryRemaining}%";
     }
 
-    private static string BuildDetail(CodexUsageSnapshot snapshot)
+    private static string BuildCodexDetail(CodexUsageSnapshot snapshot)
     {
         string primaryReset = snapshot.PrimaryResetAt is null
             ? "?"
@@ -370,6 +512,48 @@ internal sealed class TrayApplication : IDisposable
 
         return $"Reset {FormatWindow(snapshot.PrimaryWindowMinutes)} {primaryReset}, " +
                $"{FormatWindow(snapshot.SecondaryWindowMinutes)} {secondaryReset}";
+    }
+
+    private static string BuildSparkUsage(CodexUsageSnapshot? sparkSnapshot)
+    {
+        if (sparkSnapshot is null)
+        {
+            return "Spark usage: no recent Spark sessions";
+        }
+
+        int primaryRemaining = CodexUsageMath.GetRemainingPercent(sparkSnapshot.PrimaryUsedPercent);
+        int secondaryRemaining = CodexUsageMath.GetRemainingPercent(sparkSnapshot.SecondaryUsedPercent);
+        string sparkSeen = sparkSnapshot.Timestamp.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
+
+        return $"Spark: {FormatWindow(sparkSnapshot.PrimaryWindowMinutes)} left {primaryRemaining}% | " +
+               $"{FormatWindow(sparkSnapshot.SecondaryWindowMinutes)} left {secondaryRemaining}%, Spark seen {sparkSeen}";
+    }
+
+    private static string BuildClaudeTooltip(ClaudeUsageSnapshot snapshot)
+    {
+        return TruncateTooltip(
+            $"Claude 5h left {ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent)}% " +
+            $"7d left {ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent)}%");
+    }
+
+    private static string BuildClaudeHeadline(ClaudeUsageSnapshot snapshot)
+    {
+        int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
+        int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
+
+        return $"Claude: 5h left {fiveHourRemaining}% | 7d left {sevenDayRemaining}%";
+    }
+
+    private static string BuildClaudeDetail(ClaudeUsageSnapshot snapshot)
+    {
+        string fiveHourReset = snapshot.FiveHourResetAt is null
+            ? "?"
+            : snapshot.FiveHourResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
+        string sevenDayReset = snapshot.SevenDayResetAt is null
+            ? "?"
+            : snapshot.SevenDayResetAt.Value.ToLocalTime().ToString("MMM dd HH:mm", CultureInfo.InvariantCulture);
+
+        return $"Reset 5h {fiveHourReset}, 7d {sevenDayReset}";
     }
 
     private static string FormatWindow(int minutes)
@@ -418,6 +602,15 @@ internal static class CodexUsageMath
     }
 }
 
+internal static class ClaudeUsageMath
+{
+    public static int GetRemainingPercent(double usedPercent)
+    {
+        double remaining = 100d - usedPercent;
+        return Math.Clamp((int)Math.Floor(remaining), 0, 100);
+    }
+}
+
 internal sealed record CodexUsageSnapshot(
     DateTimeOffset Timestamp,
     double PrimaryUsedPercent,
@@ -427,9 +620,10 @@ internal sealed record CodexUsageSnapshot(
     DateTimeOffset? PrimaryResetAt,
     DateTimeOffset? SecondaryResetAt,
     string? PlanType,
+    string? Model,
     string SourceFile);
 
-internal sealed record UsageReadResult(CodexUsageSnapshot? Snapshot, string? ErrorMessage);
+internal sealed record UsageReadResult(CodexUsageSnapshot? Snapshot, CodexUsageSnapshot? SparkSnapshot, string? ErrorMessage);
 
 internal sealed class CodexUsageReader
 {
@@ -442,7 +636,7 @@ internal sealed class CodexUsageReader
     {
         if (!Directory.Exists(SessionsPath))
         {
-            return new UsageReadResult(null, $"Missing sessions folder: {SessionsPath}");
+            return new UsageReadResult(null, null, $"Missing sessions folder: {SessionsPath}");
         }
 
         try
@@ -455,28 +649,31 @@ internal sealed class CodexUsageReader
                 .Select(file => file.FullName);
 
             CodexUsageSnapshot? latestSnapshot = null;
+            CodexUsageSnapshot? latestSparkSnapshot = null;
 
             foreach (string file in recentFiles)
             {
-                CodexUsageSnapshot? candidate = TryReadFile(file);
-                if (candidate is null)
-                {
-                    continue;
-                }
-
-                if (latestSnapshot is null || candidate.Timestamp > latestSnapshot.Timestamp)
+                UsageFileSnapshot fileSnapshot = TryReadFile(file);
+                if (fileSnapshot.Latest is { } candidate &&
+                    (latestSnapshot is null || candidate.Timestamp > latestSnapshot.Timestamp))
                 {
                     latestSnapshot = candidate;
+                }
+
+                if (fileSnapshot.LatestSpark is { } sparkCandidate &&
+                    (latestSparkSnapshot is null || sparkCandidate.Timestamp > latestSparkSnapshot.Timestamp))
+                {
+                    latestSparkSnapshot = sparkCandidate;
                 }
             }
 
             return latestSnapshot is null
-                ? new UsageReadResult(null, "No token_count events were found in recent sessions.")
-                : new UsageReadResult(latestSnapshot, null);
+                ? new UsageReadResult(null, latestSparkSnapshot, "No token_count events were found in recent sessions.")
+                : new UsageReadResult(latestSnapshot, latestSparkSnapshot, null);
         }
         catch (Exception exception)
         {
-            return new UsageReadResult(null, exception.Message);
+            return new UsageReadResult(null, null, exception.Message);
         }
     }
 
@@ -492,21 +689,36 @@ internal sealed class CodexUsageReader
         return Path.Combine(userProfile, ".codex");
     }
 
-    private static CodexUsageSnapshot? TryReadFile(string path)
+    private static UsageFileSnapshot TryReadFile(string path)
     {
         CodexUsageSnapshot? latest = null;
+        CodexUsageSnapshot? latestSpark = null;
+        string? currentModel = null;
 
         using FileStream stream = new(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
         using StreamReader reader = new(stream);
 
         while (reader.ReadLine() is { } line)
         {
-            if (!line.Contains("\"type\":\"token_count\"", StringComparison.Ordinal))
+            bool isTurnContext = line.Contains("\"type\":\"turn_context\"", StringComparison.Ordinal);
+            bool isTokenCount = line.Contains("\"type\":\"token_count\"", StringComparison.Ordinal);
+            if (!isTurnContext && !isTokenCount)
             {
                 continue;
             }
 
-            CodexUsageSnapshot? parsed = TryParseLine(line, path);
+            if (isTurnContext && TryReadTurnContextModel(line, out string? model))
+            {
+                currentModel = model;
+                continue;
+            }
+
+            if (!isTokenCount)
+            {
+                continue;
+            }
+
+            CodexUsageSnapshot? parsed = TryParseLine(line, path, currentModel);
             if (parsed is null)
             {
                 continue;
@@ -516,12 +728,50 @@ internal sealed class CodexUsageReader
             {
                 latest = parsed;
             }
+
+            if (IsSparkSnapshot(parsed) && (latestSpark is null || parsed.Timestamp > latestSpark.Timestamp))
+            {
+                latestSpark = parsed;
+            }
         }
 
-        return latest;
+        return new UsageFileSnapshot(latest, latestSpark);
     }
 
-    private static CodexUsageSnapshot? TryParseLine(string line, string sourceFile)
+    private static bool TryReadTurnContextModel(string line, out string? model)
+    {
+        model = null;
+
+        try
+        {
+            using JsonDocument document = JsonDocument.Parse(line);
+            JsonElement root = document.RootElement;
+
+            if (!root.TryGetProperty("type", out JsonElement typeElement) ||
+                !string.Equals(typeElement.GetString(), "turn_context", StringComparison.Ordinal))
+            {
+                return false;
+            }
+
+            if (root.TryGetProperty("payload", out JsonElement payload) &&
+                payload.TryGetProperty("model", out JsonElement modelElement))
+            {
+                model = modelElement.GetString();
+            }
+
+            return true;
+        }
+        catch (JsonException)
+        {
+            return false;
+        }
+        catch (InvalidOperationException)
+        {
+            return false;
+        }
+    }
+
+    private static CodexUsageSnapshot? TryParseLine(string line, string sourceFile, string? model)
     {
         try
         {
@@ -561,6 +811,7 @@ internal sealed class CodexUsageReader
                 primary.ResetsAt,
                 secondary.ResetsAt,
                 planType,
+                model,
                 sourceFile);
         }
         catch (JsonException)
@@ -603,7 +854,157 @@ internal sealed class CodexUsageReader
         return new RateLimitInfo(usedPercent, windowMinutes, resetsAt);
     }
 
+    private static bool IsSparkSnapshot(CodexUsageSnapshot snapshot)
+    {
+        return snapshot.Model?.Contains("spark", StringComparison.OrdinalIgnoreCase) == true;
+    }
+
+    private sealed record UsageFileSnapshot(CodexUsageSnapshot? Latest, CodexUsageSnapshot? LatestSpark);
+
     private sealed record RateLimitInfo(double UsedPercent, int WindowMinutes, DateTimeOffset? ResetsAt);
+}
+
+internal sealed record ClaudeUsageSnapshot(
+    DateTimeOffset Timestamp,
+    double FiveHourUsedPercent,
+    double SevenDayUsedPercent,
+    DateTimeOffset? FiveHourResetAt,
+    DateTimeOffset? SevenDayResetAt,
+    string SourceFile);
+
+internal sealed record ClaudeUsageReadResult(ClaudeUsageSnapshot? Snapshot, string? ErrorMessage);
+
+internal sealed class ClaudeUsageReader
+{
+    private const string UsageEndpoint = "https://api.anthropic.com/api/oauth/usage";
+    private static readonly HttpClient HttpClient = new()
+    {
+        Timeout = TimeSpan.FromSeconds(20)
+    };
+
+    public string ClaudeHomePath { get; } = ResolveClaudeHome();
+    public string CredentialsPath => Path.Combine(ClaudeHomePath, ".credentials.json");
+
+    public ClaudeUsageReadResult ReadLatestSnapshot()
+    {
+        if (!File.Exists(CredentialsPath))
+        {
+            return new ClaudeUsageReadResult(null, $"Missing Claude credentials file: {CredentialsPath}");
+        }
+
+        try
+        {
+            string? accessToken = ReadAccessToken();
+            if (string.IsNullOrWhiteSpace(accessToken))
+            {
+                return new ClaudeUsageReadResult(null, "Claude OAuth access token was not found.");
+            }
+
+            using HttpRequestMessage request = new(HttpMethod.Get, UsageEndpoint);
+            request.Headers.TryAddWithoutValidation("Authorization", $"Bearer {accessToken}");
+            request.Headers.TryAddWithoutValidation("Accept", "application/json");
+            request.Headers.TryAddWithoutValidation("User-Agent", "gpttrack/1.0");
+
+            using HttpResponseMessage response = HttpClient.Send(request);
+            string responseBody = response.Content.ReadAsStringAsync().GetAwaiter().GetResult();
+            if (!response.IsSuccessStatusCode)
+            {
+                string reason = response.StatusCode == System.Net.HttpStatusCode.Unauthorized
+                    ? "Claude token expired - re-login in Claude Code"
+                    : $"Claude usage request failed: HTTP {(int)response.StatusCode}";
+                return new ClaudeUsageReadResult(null, reason);
+            }
+
+            ClaudeUsageSnapshot? snapshot = ParseUsageResponse(responseBody);
+            return snapshot is null
+                ? new ClaudeUsageReadResult(null, "Claude usage response did not include five_hour and seven_day limits.")
+                : new ClaudeUsageReadResult(snapshot, null);
+        }
+        catch (Exception exception)
+        {
+            return new ClaudeUsageReadResult(null, exception.Message);
+        }
+    }
+
+    private static string ResolveClaudeHome()
+    {
+        string? configuredHome = Environment.GetEnvironmentVariable("CLAUDE_HOME");
+        if (!string.IsNullOrWhiteSpace(configuredHome))
+        {
+            return Environment.ExpandEnvironmentVariables(configuredHome);
+        }
+
+        string userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return Path.Combine(userProfile, ".claude");
+    }
+
+    private string? ReadAccessToken()
+    {
+        string? environmentToken = Environment.GetEnvironmentVariable("CLAUDE_CODE_OAUTH_TOKEN");
+        if (!string.IsNullOrWhiteSpace(environmentToken))
+        {
+            return environmentToken;
+        }
+
+        using FileStream stream = new(CredentialsPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete);
+        using JsonDocument document = JsonDocument.Parse(stream);
+        JsonElement root = document.RootElement;
+
+        if (root.TryGetProperty("claudeAiOauth", out JsonElement oauth) &&
+            oauth.TryGetProperty("accessToken", out JsonElement accessTokenElement))
+        {
+            return accessTokenElement.GetString();
+        }
+
+        return null;
+    }
+
+    private static ClaudeUsageSnapshot? ParseUsageResponse(string responseBody)
+    {
+        using JsonDocument document = JsonDocument.Parse(responseBody);
+        JsonElement root = document.RootElement;
+
+        if (!TryReadLimit(root, "five_hour", out UsageLimit fiveHour) ||
+            !TryReadLimit(root, "seven_day", out UsageLimit sevenDay))
+        {
+            return null;
+        }
+
+        return new ClaudeUsageSnapshot(
+            DateTimeOffset.Now,
+            fiveHour.UsedPercent,
+            sevenDay.UsedPercent,
+            fiveHour.ResetsAt,
+            sevenDay.ResetsAt,
+            UsageEndpoint);
+    }
+
+    private static bool TryReadLimit(JsonElement root, string name, out UsageLimit limit)
+    {
+        limit = new UsageLimit(0, null);
+        if (!root.TryGetProperty(name, out JsonElement limitElement) ||
+            limitElement.ValueKind != JsonValueKind.Object)
+        {
+            return false;
+        }
+
+        double usedPercent = limitElement.TryGetProperty("utilization", out JsonElement utilizationElement)
+            ? utilizationElement.GetDouble()
+            : 0;
+
+        DateTimeOffset? resetsAt = null;
+        if (limitElement.TryGetProperty("resets_at", out JsonElement resetsAtElement) &&
+            resetsAtElement.ValueKind == JsonValueKind.String &&
+            DateTimeOffset.TryParse(resetsAtElement.GetString(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal, out DateTimeOffset parsedReset))
+        {
+            resetsAt = parsedReset;
+        }
+
+        limit = new UsageLimit(usedPercent, resetsAt);
+        return true;
+    }
+
+    private sealed record UsageLimit(double UsedPercent, DateTimeOffset? ResetsAt);
 }
 
 internal static class TrayIconRenderer
@@ -612,6 +1013,11 @@ internal static class TrayIconRenderer
     private const int GlyphWidth = 4;
     private const int GlyphHeight = 7;
     private const int GlyphSpacing = 1;
+
+    // Brand marker colors are fixed, not theme-dependent.
+    private const uint OpenAiBrandColor = 0xFF10A37F;
+    private const uint ClaudeBrandColor = 0xFFD97757;
+
     private static readonly IconPalette LightThemePalette = new(
         UnknownColor: 0xFF444444,
         DangerColor: 0xFF9D2B22,
@@ -648,21 +1054,63 @@ internal static class TrayIconRenderer
             primaryRemaining.ToString(CultureInfo.InvariantCulture),
             ColorForRemaining(primaryRemaining, palette),
             secondaryRemaining.ToString(CultureInfo.InvariantCulture),
-            ColorForRemaining(secondaryRemaining, palette));
+            ColorForRemaining(secondaryRemaining, palette),
+            OpenAiBrandColor);
     }
 
     public static IntPtr CreateUnavailableIcon()
     {
         IconPalette palette = GetPalette();
-        return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor);
+        return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor, OpenAiBrandColor);
     }
 
-    private static IntPtr CreateIcon(string topText, uint topColor, string bottomText, uint bottomColor)
+    public static IntPtr CreateClaudeIcon(ClaudeUsageSnapshot snapshot)
+    {
+        IconPalette palette = GetPalette();
+        int fiveHourRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.FiveHourUsedPercent);
+        int sevenDayRemaining = ClaudeUsageMath.GetRemainingPercent(snapshot.SevenDayUsedPercent);
+
+        return CreateIcon(
+            fiveHourRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(fiveHourRemaining, palette),
+            sevenDayRemaining.ToString(CultureInfo.InvariantCulture),
+            ColorForRemaining(sevenDayRemaining, palette),
+            ClaudeBrandColor);
+    }
+
+    public static IntPtr CreateClaudeUnavailableIcon()
+    {
+        IconPalette palette = GetPalette();
+        return CreateIcon("?", palette.UnknownColor, "?", palette.UnknownColor, ClaudeBrandColor);
+    }
+
+    private static IntPtr CreateIcon(
+        string topText,
+        uint topColor,
+        string bottomText,
+        uint bottomColor,
+        uint brandMarkerColor)
     {
         uint[] pixels = new uint[IconSize * IconSize];
+        DrawBrandTriangle(pixels, brandMarkerColor);
         DrawText(pixels, topText, 0, topColor);
         DrawText(pixels, bottomText, 8, bottomColor);
         return CreateNativeIcon(pixels);
+    }
+
+    private static void DrawBrandTriangle(uint[] pixels, uint color)
+    {
+        const int markerSize = 4;
+        int startY = IconSize - markerSize;
+
+        for (int y = startY; y < IconSize; y++)
+        {
+            int startX = IconSize - 1 - (y - startY);
+            for (int x = startX; x < IconSize; x++)
+            {
+                pixels[(y * IconSize) + x] = color;
+            }
+        }
     }
 
     private static void DrawText(uint[] pixels, string text, int y, uint fillColor)
