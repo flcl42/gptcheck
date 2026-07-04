@@ -14,10 +14,10 @@ It also adds a second tray icon for Claude usage from Claude Code's OAuth usage 
 
 The app uses raw Win32 tray APIs and does not depend on the Windows Desktop framework.
 
-Publish the native executable to `C:\Programs`:
+Publish the native executable to the current directory:
 
 ```powershell
-dotnet publish .\gptcheck.csproj -c Release -r win-x64 -o C:\Programs -p:PublishAot=true -p:SelfContained=true -p:InvariantGlobalization=true
+dotnet publish .\gptcheck.csproj -c Release -r win-x64 -o . -p:PublishAot=true -p:SelfContained=true -p:InvariantGlobalization=true
 ```
 
-The published binary is `C:\Programs\gpt.exe`.
+The published binary is `.\gpt.exe`.
