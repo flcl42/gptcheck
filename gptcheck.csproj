@@ -6,6 +6,7 @@
     <Nullable>enable</Nullable>
     <AssemblyName>gpt</AssemblyName>
     <RootNamespace>GptCheck</RootNamespace>
+    <Version>1.0.0</Version>
     <InvariantGlobalization>true</InvariantGlobalization>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
